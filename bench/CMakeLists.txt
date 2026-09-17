@@ -1,1 +1,2 @@
-# Placeholder until the benchmark harness lands in M2.
+add_executable(quarry_bench quarry_bench.cpp)
+target_link_libraries(quarry_bench PRIVATE quarry quarry_flags)

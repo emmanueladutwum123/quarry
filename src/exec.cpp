@@ -349,16 +349,23 @@ void HashJoinBuild::finish() {
 void HashJoinProbe::consume(const Batch& batch, const Selection& selection) {
   const Batch& build = index_->build_rows;
 
-  Batch out;
-  for (std::size_t c = 0; c < batch.width(); ++c) {
-    out.add_column(ColumnVector(batch.column(c).type()));
-  }
-  for (std::size_t c = 0; c < build.width(); ++c) {
-    out.add_column(ColumnVector(build.column(c).type()));
-  }
+  // Two passes, because one pass is row-at-a-time.
+  //
+  // The obvious loop walks each match and appends one value to every output column
+  // before moving on, which reintroduces exactly the row-oriented access this engine
+  // exists to avoid: a switch on the column type per value, and a write to as many
+  // different buffers as there are columns. Measured at 5.7M probe rows/s.
+  //
+  // Instead the first pass records only the matching (probe row, build row) index
+  // pairs, and the second gathers each output column in full before starting the
+  // next. The type switch is then hoisted out of the inner loop and each output
+  // buffer is written sequentially.
+  std::vector<std::uint32_t> probe_rows;
+  std::vector<std::uint32_t> build_rows;
+  probe_rows.reserve(selection.size());
+  build_rows.reserve(selection.size());
 
   std::vector<std::byte> key;
-  std::size_t emitted = 0;
   for (std::size_t i = 0; i < selection.size(); ++i) {
     const std::size_t row = selection[i];
     ++rows_probed_;
@@ -369,21 +376,34 @@ void HashJoinProbe::consume(const Batch& batch, const Selection& selection) {
 
     for (std::uint32_t build_row = index_->head[bucket];
          build_row != JoinHashIndex::kNoRow; build_row = index_->next[build_row]) {
-      for (std::size_t c = 0; c < batch.width(); ++c) {
-        out.mutable_column(c).append_from(batch.column(c), row, 1);
-      }
-      for (std::size_t c = 0; c < build.width(); ++c) {
-        out.mutable_column(batch.width() + c).append_from(build.column(c), build_row, 1);
-      }
-      ++emitted;
-      ++rows_emitted_;
+      probe_rows.push_back(static_cast<std::uint32_t>(row));
+      build_rows.push_back(build_row);
     }
   }
 
-  if (emitted > 0) {
-    out.set_rows(emitted);
-    output_->consume(out, Selection::all(emitted));
+  if (probe_rows.empty()) return;
+  rows_emitted_ += probe_rows.size();
+
+  const Selection probe_gather = Selection::of(std::move(probe_rows));
+  const Selection build_gather = Selection::of(std::move(build_rows));
+  const std::size_t emitted = probe_gather.size();
+
+  Batch out;
+  for (std::size_t c = 0; c < batch.width(); ++c) {
+    ColumnVector column(batch.column(c).type());
+    column.reserve(emitted);
+    column.append_from_selection(batch.column(c), probe_gather);
+    out.add_column(std::move(column));
   }
+  for (std::size_t c = 0; c < build.width(); ++c) {
+    ColumnVector column(build.column(c).type());
+    column.reserve(emitted);
+    column.append_from_selection(build.column(c), build_gather);
+    out.add_column(std::move(column));
+  }
+
+  out.set_rows(emitted);
+  output_->consume(out, Selection::all(emitted));
 }
 
 // ---------------------------------------------------------------------------

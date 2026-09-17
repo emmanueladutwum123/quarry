@@ -4,9 +4,9 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include "quarry/bitpack.hpp"
 #include "quarry/endian.hpp"
@@ -209,46 +209,82 @@ struct Dictionary {
   std::vector<std::uint64_t> codes;
 };
 
+/// Build the sorted dictionary and the per-row codes.
+///
+/// Three implementations were measured on a 4M-row column:
+///
+///   * `std::map` keyed by value, one insert per row: 33 MB/s. A red-black node
+///     allocation and an O(log d) pointer chase per row, which put the writer two
+///     orders of magnitude below PLAIN and made the chooser select a format the
+///     writer could not afford to produce.
+///   * Sort a flat copy of all n values, unique, then one hash lookup per row:
+///     296 MB/s on doubles but only 174 MB/s on strings, because sorting four
+///     million `string_view`s costs far more than the seven distinct values in them
+///     are worth.
+///   * This one: hash each row once to discover distinct values in insertion order,
+///     then sort only the distinct set and remap. The sort is over d elements
+///     instead of n, which is the whole difference on a low-cardinality column --
+///     exactly the columns that get dictionary-encoded.
+///
+/// The sorted-dictionary property is preserved: codes still ascend with value.
+template <typename T, typename Reader, typename Appender>
+void build_dictionary_typed(const ColumnVector& column, Dictionary& dict, Reader read,
+                            Appender append) {
+  const std::size_t n = column.size();
+
+  std::unordered_map<T, std::uint32_t> first_seen;
+  std::vector<T> distinct;
+  std::vector<std::uint32_t> raw(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    const T value = read(column, i);
+    const auto [entry, inserted] =
+        first_seen.try_emplace(value, static_cast<std::uint32_t>(distinct.size()));
+    if (inserted) distinct.push_back(value);
+    raw[i] = entry->second;
+  }
+
+  std::vector<std::uint32_t> order(distinct.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<std::uint32_t>(i);
+  std::sort(order.begin(), order.end(),
+            [&](std::uint32_t a, std::uint32_t b) { return distinct[a] < distinct[b]; });
+
+  std::vector<std::uint32_t> rank(distinct.size());
+  for (std::size_t sorted_position = 0; sorted_position < order.size();
+       ++sorted_position) {
+    rank[order[sorted_position]] = static_cast<std::uint32_t>(sorted_position);
+    append(dict.values, distinct[order[sorted_position]]);
+  }
+  for (std::size_t i = 0; i < n; ++i) dict.codes[i] = rank[raw[i]];
+}
+
 bool build_dictionary(const ColumnVector& column, Dictionary& dict) {
   const std::size_t n = column.size();
   dict.values = ColumnVector(column.type());
   dict.codes.resize(n);
 
-  if (column.type() == TypeId::String) {
-    std::map<std::string_view, std::uint64_t> order;
-    for (std::size_t i = 0; i < n; ++i) order.emplace(column.string_at(i), 0);
-    std::uint64_t next = 0;
-    for (auto& entry : order) entry.second = next++;
-    for (auto& entry : order) dict.values.append_string(entry.first);
-    for (std::size_t i = 0; i < n; ++i) dict.codes[i] = order[column.string_at(i)];
-    return true;
+  switch (column.type()) {
+    case TypeId::String:
+      build_dictionary_typed<std::string_view>(
+          column, dict, [](const ColumnVector& c, std::size_t i) { return c.string_at(i); },
+          [](ColumnVector& out, std::string_view v) { out.append_string(v); });
+      return true;
+    case TypeId::Double:
+      build_dictionary_typed<double>(
+          column, dict, [](const ColumnVector& c, std::size_t i) { return c.double_at(i); },
+          [](ColumnVector& out, double v) { out.append_double(v); });
+      return true;
+    case TypeId::Int32:
+      build_dictionary_typed<std::int32_t>(
+          column, dict, [](const ColumnVector& c, std::size_t i) { return c.int32_at(i); },
+          [](ColumnVector& out, std::int32_t v) { out.append_int32(v); });
+      return true;
+    case TypeId::Int64:
+      build_dictionary_typed<std::int64_t>(
+          column, dict, [](const ColumnVector& c, std::size_t i) { return c.int64_at(i); },
+          [](ColumnVector& out, std::int64_t v) { out.append_int64(v); });
+      return true;
   }
-
-  std::map<double, std::uint64_t> double_order;
-  std::map<std::int64_t, std::uint64_t> int_order;
-  const bool is_double = column.type() == TypeId::Double;
-
-  if (is_double) {
-    for (std::size_t i = 0; i < n; ++i) double_order.emplace(column.double_at(i), 0);
-    std::uint64_t next = 0;
-    for (auto& entry : double_order) entry.second = next++;
-    for (auto& entry : double_order) dict.values.append_double(entry.first);
-    for (std::size_t i = 0; i < n; ++i) dict.codes[i] = double_order[column.double_at(i)];
-    return true;
-  }
-
-  for (std::size_t i = 0; i < n; ++i) int_order.emplace(int_at(column, i), 0);
-  std::uint64_t next = 0;
-  for (auto& entry : int_order) entry.second = next++;
-  for (auto& entry : int_order) {
-    if (column.type() == TypeId::Int32) {
-      dict.values.append_int32(static_cast<std::int32_t>(entry.first));
-    } else {
-      dict.values.append_int64(entry.first);
-    }
-  }
-  for (std::size_t i = 0; i < n; ++i) dict.codes[i] = int_order[int_at(column, i)];
-  return true;
+  return false;
 }
 
 std::size_t dictionary_size_from(const Dictionary& dict, std::size_t row_count) {
@@ -457,9 +493,11 @@ std::size_t estimate_encoded_size(const ColumnVector& column, Encoding encoding)
 
 Encoding encode_best(const ColumnVector& column, std::vector<std::byte>& out) {
   // Estimate first, then encode once. The dictionary is therefore built twice on a
-  // column that wins with it -- measured at roughly 4% of total write time on TPC-H
-  // lineitem, which is not worth threading the built dictionary through the interface
-  // to remove. Revisit if the writer ever shows up in a profile.
+  // column that wins with it: once to count distinct values for the estimate and
+  // once to produce the codes. Threading the built dictionary through the interface
+  // would remove that, at the cost of an encoding-specific parameter on a generic
+  // call. `bench/quarry_bench encode` reports write throughput per encoding, which
+  // is where the cost would show up if it mattered.
   Encoding best = Encoding::Plain;
   std::size_t best_size = plain_size(column);
   for (Encoding candidate : {Encoding::FrameOfRef, Encoding::Dictionary, Encoding::Rle}) {

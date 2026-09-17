@@ -2,6 +2,7 @@
 #include "quarry/segment.hpp"
 #include "test_harness.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <random>

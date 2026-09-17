@@ -3,6 +3,8 @@
 #include "test_harness.hpp"
 
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>

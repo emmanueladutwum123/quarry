@@ -8,6 +8,7 @@
 /// engine's actual surface, including the scan counters, which is the part worth
 /// looking at.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(quarry
         VERSION 0.1.0
-        DESCRIPTION "A distributed columnar query engine: encoded storage, vectorized execution, shuffle joins"
+        DESCRIPTION "A columnar query engine: encoded storage with zone-map pruning, vectorized push-based execution"
         LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)

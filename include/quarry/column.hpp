@@ -153,6 +153,25 @@ class ColumnVector {
 
   void set_validity(Bitmap validity) { validity_ = std::move(validity); }
 
+  /// Append the rows named by a selection, in selection order. The gather the
+  /// execution layer performs whenever a filtered batch has to be materialised.
+  template <typename SelectionT>
+  void append_from_selection(const ColumnVector& source, const SelectionT& selection) {
+    for (std::size_t i = 0; i < selection.size(); ++i) {
+      const std::size_t row = selection[i];
+      if (!source.is_valid(row)) {
+        append_null();
+        continue;
+      }
+      switch (type_) {
+        case TypeId::Int32: append_int32(source.int32_at(row)); break;
+        case TypeId::Int64: append_int64(source.int64_at(row)); break;
+        case TypeId::Double: append_double(source.double_at(row)); break;
+        case TypeId::String: append_string(source.string_at(row)); break;
+      }
+    }
+  }
+
   /// Append `count` rows of `source` starting at `begin`. The writer uses this to
   /// accumulate batches into a row group without materialising rows in between.
   void append_from(const ColumnVector& source, std::size_t begin, std::size_t count) {

@@ -1,6 +1,7 @@
 add_library(quarry
   types.cpp
   encoding.cpp
+  expression.cpp
   mapped_file.cpp
   segment.cpp
 )

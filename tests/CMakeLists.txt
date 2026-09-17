@@ -2,6 +2,7 @@ add_executable(quarry_tests
   test_main.cpp
   test_bitpack.cpp
   test_encoding.cpp
+  test_expression.cpp
   test_segment.cpp
 )
 target_link_libraries(quarry_tests PRIVATE quarry quarry_flags)

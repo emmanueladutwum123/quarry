@@ -33,6 +33,7 @@ namespace quarry {
 /// index. FNV-1a does not -- its low bits are poor, and a table masking them gets
 /// clustering that looks like a workload problem.
 inline std::uint64_t hash_bytes(const std::byte* data, std::size_t length) {
+  if (length == 0) return 0x9E3779B97F4A7C15ULL;  // null data is legal at length 0
   std::uint64_t h = 0x9E3779B97F4A7C15ULL ^ (length * 0xFF51AFD7ED558CCDULL);
   std::size_t i = 0;
   for (; i + 8 <= length; i += 8) {
@@ -63,7 +64,10 @@ class KeyArena {
  public:
   std::uint64_t append(const std::byte* data, std::uint32_t length) {
     const std::uint64_t at = bytes_.size();
-    bytes_.insert(bytes_.end(), data, data + length);
+    // A zero-length key is legitimate: an aggregate with no GROUP BY has exactly one
+    // group, whose key is the empty byte string. `data` is then null, and pointer
+    // arithmetic on null is undefined even for a zero offset.
+    if (length != 0) bytes_.insert(bytes_.end(), data, data + length);
     return at;
   }
   const std::byte* at(std::uint64_t offset) const { return bytes_.data() + offset; }
@@ -101,7 +105,7 @@ class GroupHashTable {
         return entry.payload;
       }
       if (entry.hash == hash && entry.key_length == length &&
-          std::memcmp(arena_.at(entry.key_offset), key, length) == 0) {
+          (length == 0 || std::memcmp(arena_.at(entry.key_offset), key, length) == 0)) {
         inserted = false;
         return entry.payload;
       }
@@ -117,7 +121,7 @@ class GroupHashTable {
       const Slot& entry = slots_[slot];
       if (entry.payload == kEmpty) return kEmpty;
       if (entry.hash == hash && entry.key_length == length &&
-          std::memcmp(arena_.at(entry.key_offset), key, length) == 0) {
+          (length == 0 || std::memcmp(arena_.at(entry.key_offset), key, length) == 0)) {
         return entry.payload;
       }
       slot = (slot + 1) & mask_;

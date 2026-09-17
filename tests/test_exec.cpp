@@ -415,3 +415,57 @@ TEST(projection_produces_computed_columns) {
     CHECK_NEAR(result.column(1).double_at(i), data.rows[i].amount * 2.0, 1e-9);
   }
 }
+
+TEST(a_global_aggregate_has_one_group_with_an_empty_key) {
+  // No GROUP BY: one group whose serialised key is zero bytes. The zero-length key
+  // is what makes a null data pointer reach memcmp and the arena, which is
+  // undefined behaviour even at length zero -- UBSan on one CI leg is what found it.
+  ColumnVector value(TypeId::Int64);
+  for (int i = 1; i <= 100; ++i) value.append_int64(i);
+  Batch batch;
+  batch.add_column(std::move(value));
+  batch.set_rows(100);
+
+  HashAggregate aggregate({}, {},
+                          {AggSpec{AggFunc::Count, 0, TypeId::Int64, true, "n"},
+                           AggSpec{AggFunc::Sum, 0, TypeId::Int64, false, "total"}});
+  aggregate.consume(batch, Selection::all(batch.rows()));
+
+  CHECK_EQ(aggregate.group_count(), std::size_t{1});
+  const Batch result = aggregate.result();
+  CHECK_EQ(result.rows(), std::size_t{1});
+  CHECK_EQ(result.column(0).int64_at(0), std::int64_t{100});
+  CHECK_EQ(result.column(1).int64_at(0), std::int64_t{5050});
+}
+
+TEST(an_empty_batch_survives_every_operator) {
+  // Zero rows reaches memset, memcpy and pointer arithmetic with null pointers in
+  // several places. Each is undefined even at length zero.
+  Batch empty;
+  empty.add_column(ColumnVector(TypeId::Int64));
+  empty.add_column(ColumnVector(TypeId::String));
+  empty.set_rows(0);
+
+  CollectSink sink;
+  FilterOp filter(compare(CompareOp::Gt, column_ref(0, TypeId::Int64),
+                          literal(Value::of_int64(0))),
+                  &sink);
+  filter.consume(empty, Selection::all(0));
+  CHECK_EQ(sink.total_rows(), std::size_t{0});
+
+  HashAggregate aggregate({0}, {TypeId::Int64},
+                          {AggSpec{AggFunc::Count, 0, TypeId::Int64, true, "n"}});
+  aggregate.consume(empty, Selection::all(0));
+  CHECK_EQ(aggregate.group_count(), std::size_t{0});
+  CHECK_EQ(aggregate.result().rows(), std::size_t{0});
+
+  JoinHashIndex index;
+  HashJoinBuild build({0}, &index);
+  build.consume(empty, Selection::all(0));
+  build.finish();
+
+  CollectSink joined;
+  HashJoinProbe probe({0}, &index, &joined);
+  probe.consume(empty, Selection::all(0));
+  CHECK_EQ(joined.total_rows(), std::size_t{0});
+}

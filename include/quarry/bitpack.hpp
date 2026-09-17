@@ -72,6 +72,11 @@ inline void pack(const std::uint64_t* values, std::size_t count, std::uint32_t w
 /// Unpack `count` values of `width` bits into `out`.
 inline void unpack(const std::byte* in, std::size_t count, std::uint32_t width,
                    std::uint64_t* out) {
+  // An empty column is a real case -- a row group can be flushed with zero rows in a
+  // column, and `vector<uint64_t>(0).data()` is null. Passing a null pointer to
+  // memset or memcpy is undefined even when the length is zero, so the early return
+  // is load-bearing rather than an optimisation.
+  if (count == 0) return;
   if (width == 0) {
     std::memset(out, 0, count * sizeof(std::uint64_t));
     return;
